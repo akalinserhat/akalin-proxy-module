@@ -214,3 +214,31 @@ export interface CreateProxyModuleOptions {
   /** Bildirim/Toast geri çağrısı */
   onNotify?: (message: string, type?: 'success' | 'error' | 'info') => void;
 }
+
+export interface ProxyModuleDatabaseConfig {
+  engine: 'postgresql';
+  host: string;
+  port: number;
+  databaseName: string;
+  tables: readonly string[];
+  schemaSqlRelativePath: string;
+  pythonManagerRelativePath: string;
+  cliBridgeRelativePath: string;
+}
+
+export const PROXY_MODULE_DATABASE_CONFIG: ProxyModuleDatabaseConfig = {
+  engine: 'postgresql',
+  host: '127.0.0.1',
+  port: 5432,
+  databaseName: 'akalin_proxy_db',
+  tables: [
+    'proxy_nodes',
+    'browser_sessions',
+    'pool_metrics_snapshots',
+    'pool_scaling_events',
+    'proxy_pool_settings',
+  ],
+  schemaSqlRelativePath: 'database/schema.sql',
+  pythonManagerRelativePath: 'database/proxy_postgres_db.py',
+  cliBridgeRelativePath: 'database/proxy_cli_bridge.py',
+};
