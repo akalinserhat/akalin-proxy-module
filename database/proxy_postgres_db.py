@@ -36,7 +36,13 @@ _drv_spec.loader.exec_module(_drv_mod)
 PgWireConnection = _drv_mod.PgWireConnection
 
 _schema_path = Path(__file__).resolve().parent / "schema.sql"
-SCHEMA_SQL = _schema_path.read_text(encoding="utf-8")
+_raw_schema = _schema_path.read_text(encoding="utf-8")
+SCHEMA_SQL = re.sub(
+    r"\bCREATE\s+(TABLE|INDEX)\s+(?!IF\s+NOT\s+EXISTS\b)",
+    r"CREATE \1 IF NOT EXISTS ",
+    _raw_schema,
+    flags=re.IGNORECASE,
+)
 
 PROXY_FEED_SOURCES: Dict[str, List[str]] = {
     "http": [

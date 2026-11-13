@@ -106,7 +106,7 @@ export interface PoolScalingEventDTO {
   reason?: string;
   detail?: string;
   total_sessions_after: number;
-  dynamic_sessions_after: number;
+  dynamic_sessions_after?: number;
   timestamp_iso?: string;
   created_at?: string;
 }
@@ -124,7 +124,7 @@ export interface PoolDashboardMetricsDTO {
     max_capacity: number;
     utilization_pct: number;
     active_proxies: number;
-    total_proxies: number;
+    total_proxies?: number;
     cooldown_proxies: number;
     avg_proxy_latency_ms: number;
     total_requests_served: number;
