@@ -50,6 +50,23 @@ SCHEMA_SQL = re.sub(
     flags=re.IGNORECASE,
 )
 
+
+def _create_verified_ssl_context() -> ssl.SSLContext:
+    """macOS / Linux ortamlarında sistem CA sertifikalarını yükleyen doğrulanmış SSL bağlamı döner."""
+    try:
+        if os.path.exists("/etc/ssl/cert.pem"):
+            return ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+        ctx = ssl.create_default_context()
+        if ctx.cert_store_stats().get("x509_ca", 0) > 0:
+            return ctx
+    except Exception:
+        pass
+    try:
+        import certifi  # type: ignore
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
 PROXY_FEED_SOURCES: Dict[str, List[str]] = {
     "http": [
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=elite",
@@ -182,6 +199,7 @@ class ProxyPostgresDatabaseManager:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._heal_lock = threading.Lock()
         self._rotation_cursor: int = 0
         self._pool_verified_at: float = 0.0
         self._proxy_runtime_stats: Dict[str, Any] = {
@@ -636,6 +654,40 @@ class ProxyPostgresDatabaseManager:
             return (False, 999)
 
     @classmethod
+    def probe_proxy_https_tunnel_sync(
+        cls,
+        proxy_node: Dict[str, Any],
+        target_host: str = "text.pollinations.ai",
+        target_port: int = 443,
+        timeout: float = 2.4,
+    ) -> Tuple[bool, int]:
+        """Proxy düğümü üzerinden gerçek SOCKS5/SOCKS4/CONNECT tünelini ve TLS el sıkışmasını doğrular."""
+        t0 = time.perf_counter()
+        raw_sock: Optional[socket.socket] = None
+        tls_sock: Optional[socket.socket] = None
+        try:
+            raw_sock = cls.open_proxy_tunnel_socket(
+                proxy_node,
+                target_host=target_host,
+                target_port=target_port,
+                timeout=timeout,
+            )
+            raw_sock.settimeout(max(timeout, 2.8))
+            ctx = _create_verified_ssl_context()
+            tls_sock = ctx.wrap_socket(raw_sock, server_hostname=target_host)
+            elapsed_ms = max(8, int((time.perf_counter() - t0) * 1000))
+            return (True, elapsed_ms)
+        except Exception:
+            return (False, 999)
+        finally:
+            for s_obj in (tls_sock, raw_sock):
+                if s_obj is not None:
+                    try:
+                        s_obj.close()
+                    except Exception:
+                        pass
+
+    @classmethod
     def probe_proxy_latency_sync(cls, endpoint: str) -> int:
         ok, ms = cls.probe_proxy_tcp_sync(endpoint, timeout=1.2)
         return ms if ok else random.randint(180, 420)
@@ -646,12 +698,13 @@ class ProxyPostgresDatabaseManager:
         force: bool = False,
     ) -> Dict[str, Any]:
         """
-        `akalin_proxy_db` içerisindeki tüm proxy'leri paralel (ThreadPool) olarak TCP seviyesinde
-        test eder; erişilemeyenleri 'cooldown' durumuna alır, erişilebilenleri gerçek gecikmesiyle
-        'active' yapar. Aktif proxy sayısı `min_active` altına düşerse canlı beslemelerden takviye yapar.
+        `akalin_proxy_db` içerisindeki tüm proxy'leri paralel (ThreadPool) olarak gerçek HTTPS tünel
+        ve TLS el sıkışma seviyesinde test eder; erişilemeyenleri 'cooldown' durumuna alır, çalışanları
+        gerçek tünel gecikmesiyle 'active' yapar. Aktif proxy sayısı `min_active` altına düşerse canlı
+        beslemelerden doğrulanmış yeni proxy'lerle takviye yapar.
         """
         now_ts = time.time()
-        if not force and (now_ts - self._pool_verified_at) < 120.0:
+        if not force and (now_ts - self._pool_verified_at) < 180.0:
             proxies = self.list_proxies()
             active = [p for p in proxies if p.get("status") == "active"]
             if len(active) >= min_active:
@@ -661,61 +714,74 @@ class ProxyPostgresDatabaseManager:
                     "cooldown_count": len(proxies) - len(active),
                 }
 
-        proxies = self.list_proxies()
-        results: Dict[str, Tuple[bool, int]] = {}
-        with ThreadPoolExecutor(max_workers=20) as pool:
-            fut_map = {
-                pool.submit(self.probe_proxy_tcp_sync, str(p["endpoint"]), 1.2): str(p["id"])
-                for p in proxies
+        acquired = self._heal_lock.acquire(blocking=force)
+        if not acquired:
+            proxies = self.list_proxies()
+            active = [p for p in proxies if p.get("status") == "active"]
+            return {
+                "checked": len(proxies),
+                "active_count": len(active),
+                "cooldown_count": len(proxies) - len(active),
             }
-            for fut in as_completed(fut_map):
-                pid = fut_map[fut]
-                try:
-                    results[pid] = fut.result()
-                except Exception:
-                    results[pid] = (False, 999)
 
-        now_iso = datetime.now(timezone.utc).isoformat()
-        active_count = 0
-        cooldown_count = 0
-        with self.connection() as conn:
-            for p in proxies:
-                pid = str(p["id"])
-                ok, ms = results.get(pid, (False, 999))
-                if ok:
-                    active_count += 1
-                    conn.execute(
-                        """
-                        UPDATE proxy_nodes
-                        SET status = 'active', latency_ms = ?, fails = 0,
-                            last_checked_at = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (ms, now_iso, now_iso, pid),
-                    )
-                else:
-                    cooldown_count += 1
-                    next_fails = int(p.get("fails") or 0) + 1
-                    conn.execute(
-                        """
-                        UPDATE proxy_nodes
-                        SET status = 'cooldown', fails = ?,
-                            last_checked_at = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (next_fails, now_iso, now_iso, pid),
-                    )
+        try:
+            proxies = self.list_proxies()
+            results: Dict[str, Tuple[bool, int]] = {}
+            with ThreadPoolExecutor(max_workers=24) as pool:
+                fut_map = {
+                    pool.submit(self.probe_proxy_https_tunnel_sync, p, "text.pollinations.ai", 443, 2.4): str(p["id"])
+                    for p in proxies
+                }
+                for fut in as_completed(fut_map):
+                    pid = fut_map[fut]
+                    try:
+                        results[pid] = fut.result()
+                    except Exception:
+                        results[pid] = (False, 999)
 
-        if active_count < min_active:
-            added = self.fetch_free_proxies_sync(protocol="all", limit=max(8, min_active - active_count + 4))
-            active_count += sum(1 for a in added if a.get("status") == "active")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            active_count = 0
+            cooldown_count = 0
+            with self.connection() as conn:
+                for p in proxies:
+                    pid = str(p["id"])
+                    ok, ms = results.get(pid, (False, 999))
+                    if ok:
+                        active_count += 1
+                        conn.execute(
+                            """
+                            UPDATE proxy_nodes
+                            SET status = 'active', latency_ms = ?, fails = 0,
+                                last_checked_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (ms, now_iso, now_iso, pid),
+                        )
+                    else:
+                        cooldown_count += 1
+                        next_fails = int(p.get("fails") or 0) + 1
+                        conn.execute(
+                            """
+                            UPDATE proxy_nodes
+                            SET status = 'cooldown', fails = ?,
+                                last_checked_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (next_fails, now_iso, now_iso, pid),
+                        )
 
-        self._pool_verified_at = time.time()
-        return {
-            "checked": len(proxies),
-            "active_count": active_count,
-            "cooldown_count": cooldown_count,
-        }
+            if active_count < min_active:
+                added = self.fetch_free_proxies_sync(protocol="all", limit=max(10, min_active - active_count + 6))
+                active_count += sum(1 for a in added if a.get("status") == "active")
+
+            self._pool_verified_at = time.time()
+            return {
+                "checked": len(proxies),
+                "active_count": active_count,
+                "cooldown_count": cooldown_count,
+            }
+        finally:
+            self._heal_lock.release()
 
     def acquire_rotating_proxies(self, count: int = 6) -> List[Dict[str, Any]]:
         """
@@ -946,7 +1012,7 @@ class ProxyPostgresDatabaseManager:
         if parsed.query:
             path_and_query += f"?{parsed.query}"
 
-        ctx = ssl_context or ssl.create_default_context()
+        ctx = ssl_context or _create_verified_ssl_context()
         candidates = self.acquire_rotating_proxies(count=max(3, max_proxy_attempts + 1))
 
         user_agents = (
@@ -1130,12 +1196,15 @@ class ProxyPostgresDatabaseManager:
 
     def fetch_free_proxies_sync(self, protocol: str = "all", limit: int = 6) -> List[Dict[str, Any]]:
         limit = max(1, min(25, int(limit or 6)))
+        sample_budget = max(limit * 5, 36)
         existing = self.get_existing_endpoints()
-        protos = ["http", "socks5", "socks4"] if protocol == "all" else [protocol.lower()]
+        protos = ["socks5", "socks4", "https", "http"] if protocol == "all" else [protocol.lower()]
         collected: List[Tuple[str, str]] = []
 
-        ctx = ssl.create_default_context()
+        ctx = _create_verified_ssl_context()
+        per_proto_cap = max(8, sample_budget // max(1, len(protos)))
         for proto in protos:
+            proto_added = 0
             for url in PROXY_FEED_SOURCES.get(proto, PROXY_FEED_SOURCES["http"]):
                 try:
                     req = urllib.request.Request(
@@ -1143,34 +1212,61 @@ class ProxyPostgresDatabaseManager:
                         headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
                         method="GET",
                     )
-                    with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+                    with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
                         if resp.status == 200:
                             lines = resp.read().decode("utf-8", errors="ignore").splitlines()
                             random.shuffle(lines)
                             for line in lines:
                                 clean = line.strip()
-                                if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}$", clean) and clean not in existing:
-                                    existing.add(clean)
-                                    collected.append((proto, clean))
-                                    if len(collected) >= limit:
-                                        break
+                                if not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}$", clean) or clean in existing:
+                                    continue
+                                if proto in ("http", "https") and clean.endswith(":80"):
+                                    continue
+                                existing.add(clean)
+                                collected.append((proto, clean))
+                                proto_added += 1
+                                if proto_added >= per_proto_cap or len(collected) >= sample_budget:
+                                    break
                 except Exception:
                     pass
-                if len(collected) >= limit:
+                if proto_added >= per_proto_cap or len(collected) >= sample_budget:
                     break
-            if len(collected) >= limit:
+            if len(collected) >= sample_budget:
                 break
 
         if len(collected) < limit:
             for proto, ep in FALLBACK_PUBLIC_PROXIES:
-                if len(collected) >= limit:
+                if len(collected) >= sample_budget:
                     break
                 if protocol in ("all", proto) and ep not in existing:
                     existing.add(ep)
                     collected.append((proto, ep))
 
+        verified_candidates: List[Tuple[str, str, int, bool]] = []
+        if collected:
+            with ThreadPoolExecutor(max_workers=24) as pool:
+                fut_map = {
+                    pool.submit(
+                        self.probe_proxy_https_tunnel_sync,
+                        {"protocol": p_proto, "endpoint": p_ep},
+                        "text.pollinations.ai",
+                        443,
+                        2.3,
+                    ): (p_proto, p_ep)
+                    for (p_proto, p_ep) in collected
+                }
+                for fut in as_completed(fut_map):
+                    p_proto, p_ep = fut_map[fut]
+                    try:
+                        ok, ms = fut.result()
+                    except Exception:
+                        ok, ms = (False, 999)
+                    verified_candidates.append((p_proto, p_ep, ms, ok))
+
+        verified_candidates.sort(key=lambda x: (0 if x[3] else 1, x[2]))
+
         added: List[Dict[str, Any]] = []
-        for proto, ep in collected[:limit]:
+        for proto, ep, ms, is_live in verified_candidates[:limit]:
             ctry, city = random.choice(PROXY_REGIONS)
             ptype = random.choice(["datacenter", "residential", "isp"])
             node = {
@@ -1181,9 +1277,9 @@ class ProxyPostgresDatabaseManager:
                 "city": city,
                 "proxy_type": ptype,
                 "provider": "Public Feed (Live)",
-                "latency_ms": random.randint(28, 165),
-                "status": "active",
-                "fails": 0,
+                "latency_ms": ms if is_live else random.randint(180, 390),
+                "status": "active" if is_live else "cooldown",
+                "fails": 0 if is_live else 2,
             }
             saved = self.insert_proxy(node)
             added.append(saved)
