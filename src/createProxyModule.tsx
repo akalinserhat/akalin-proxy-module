@@ -123,12 +123,6 @@ export function createProxyModule(
         requiredPermissions: ['proxy.view'],
       },
       {
-        path: `${baseRoute}/sessions`,
-        element: <ConnectedLazySessionsRoute />,
-        title: 'Bağlantı Havuzu — Oturumlar',
-        requiredPermissions: ['proxy.sessions.manage'],
-      },
-      {
         path: `${baseRoute}/proxies`,
         element: <ConnectedLazyProxiesRoute />,
         title: 'Bağlantı Havuzu — Proxy Listesi',
@@ -150,13 +144,6 @@ export function createProxyModule(
             path: baseRoute,
             icon: <ServerCog size={18} />,
             requiredPermissions: ['proxy.view'],
-          },
-          {
-            id: 'proxy-pool-sessions',
-            label: 'Oturumlar',
-            path: `${baseRoute}/sessions`,
-            icon: <MonitorCheck size={18} />,
-            requiredPermissions: ['proxy.sessions.manage'],
           },
           {
             id: 'proxy-pool-list',

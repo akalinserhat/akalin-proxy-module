@@ -116,15 +116,15 @@ export const NodesPoolView: NodesPoolPageComponent = ({
     propMaxConcurrentBrowsers ?? ctxMaxConcurrent ?? 16;
 
   const [localSection, setLocalSection] = useState<NodesPoolSection>(
-    propActiveSection || 'dashboard'
+    propActiveSection === 'sessions' ? 'proxies' : (propActiveSection || 'dashboard')
   );
   useEffect(() => {
     if (propActiveSection) {
-      setLocalSection(propActiveSection);
+      setLocalSection(propActiveSection === 'sessions' ? 'proxies' : propActiveSection);
     }
   }, [propActiveSection]);
 
-  const activeSection = propActiveSection ?? localSection;
+  const activeSection = (propActiveSection === 'sessions' ? 'proxies' : propActiveSection) ?? localSection;
 
   const [internalProxies, setInternalProxies] =
     useState<ProxyNodeDTO[]>(DEFAULT_SEED_PROXIES);
@@ -840,8 +840,8 @@ export const NodesPoolView: NodesPoolPageComponent = ({
   };
 
   const isDashboardView = activeSection === 'dashboard';
-  const isSessionsView = activeSection === 'sessions';
-  const isProxiesView = activeSection === 'proxies';
+  const isSessionsView = false;
+  const isProxiesView = activeSection === 'proxies' || activeSection === 'sessions';
 
   const timelinePoints = useMemo(() => {
     const baseTimeline = sqliteTelemetry?.timeline?.length
@@ -1091,27 +1091,16 @@ export const NodesPoolView: NodesPoolPageComponent = ({
       title={
         isDashboardView
           ? `${t('nav.nodes')} — ${t('nav.nodesDashboard')}`
-          : isSessionsView
-            ? `${t('nav.nodes')} — ${t('nav.nodesSessions')}`
-            : `${t('nav.nodes')} — ${t('nav.nodesProxies')}`
+          : `${t('nav.nodes')} — ${t('nav.nodesProxies')}`
       }
       subtitle={
         isDashboardView
           ? t('nodes.dashboardSubtitle')
-          : isSessionsView
-            ? t('nodes.sessionsSubtitle', {
-                current: sessions.length,
-                max: maxConcurrentBrowsers,
-                warm: warmSessionCount,
-                dynamic: dynamicSessionCount,
-              })
-            : `${t('nodes.activeNodesCount', { active: activeCount, total: proxies.length })} · ${t('nodes.avgLatency')}: ${avgLatency} ms`
+          : `${t('nodes.activeNodesCount', { active: activeCount, total: proxies.length })} · ${t('nodes.avgLatency')}: ${avgLatency} ms`
       }
       icon={
         isDashboardView ? (
           <ServerCog size={22} />
-        ) : isSessionsView ? (
-          <MonitorCheck size={22} />
         ) : (
           <Globe size={22} />
         )
@@ -1125,13 +1114,6 @@ export const NodesPoolView: NodesPoolPageComponent = ({
             <BaseButton
               variant="outline"
               className="btn-sm"
-              icon={<MonitorCheck size={15} />}
-              text={t('nodes.sessionsCountBtn', { count: sessions.length })}
-              onClick={() => handleNavigateSection('sessions')}
-            />
-            <BaseButton
-              variant="outline"
-              className="btn-sm"
               icon={<Globe size={15} />}
               text={t('nodes.proxiesCountBtn', { count: proxies.length })}
               onClick={() => handleNavigateSection('proxies')}
@@ -1139,35 +1121,11 @@ export const NodesPoolView: NodesPoolPageComponent = ({
             <BaseButton
               variant="primary"
               className="btn-sm"
-              icon={<Zap size={15} />}
-              text={t('nodes.spawnDynamicBtn')}
+              icon={<Plus size={15} />}
+              text={t('nodes.addProxyBtn')}
               onClick={() => {
                 setFormErrors({});
-                setIsSpawnModalOpen(true);
-              }}
-            />
-          </div>
-        ) : isSessionsView ? (
-          <div className="flex items-center gap-8 flex-wrap">
-            {idleDynamicCount > 0 && (
-              <BaseButton
-                variant="outline"
-                className="btn-sm"
-                icon={<Trash2 size={15} />}
-                isSaving={pruningSessions}
-                loadingText={t('nodes.pruningIdle')}
-                text={t('nodes.pruneIdleBtn', { count: idleDynamicCount })}
-                onClick={handlePruneDynamic}
-              />
-            )}
-            <BaseButton
-              variant="primary"
-              className="btn-sm"
-              icon={<Zap size={15} />}
-              text={t('nodes.spawnDynamicBtn')}
-              onClick={() => {
-                setFormErrors({});
-                setIsSpawnModalOpen(true);
+                setIsModalOpen(true);
               }}
             />
           </div>
